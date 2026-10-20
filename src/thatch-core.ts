@@ -42,6 +42,13 @@ export interface ThatchDBLike {
   close?(): void;
 }
 
+export interface BatchToolCall {
+  tool_name: string;
+  tool_input: Record<string, unknown>;
+  tool_use_id?: string;
+  tool_response: string | unknown[];
+}
+
 interface ThatchCore {
   ThatchDB: new (dbPath: string, opts?: unknown) => ThatchDBLike;
   repoPathCache: (db: ThatchDBLike) => unknown;
@@ -50,6 +57,24 @@ interface ThatchCore {
   recallNudge: (matches: NudgeMatch[]) => string;
   predictionNudge: (items: unknown[]) => string;
   behaviorNudge: (items: unknown[]) => string;
+  // extract-queue.ts (file-backed, shared with the thatch MCP server process)
+  appendBatch: (sessionID: string, toolCalls: BatchToolCall[]) => void;
+  peekQueue: (sessionID: string) => unknown[];
+  getMissedCount: (sessionID: string) => number;
+  incrementMissedCount: (sessionID: string) => void;
+  resetMissedCount: (sessionID: string) => void;
+  // provisioning (methodology / commands / skills)
+  cursorInstructions: () => string;
+  mcpToolName: (name: string) => string;
+  actionDefs: (tool: (name: string) => string) => ActionDef[];
+  installSkills: (skillsDir: string) => unknown;
+}
+
+export interface ActionDef {
+  name: string;
+  description: string;
+  body: string;
+  opencodeOnly?: boolean;
 }
 
 // --- Package-root resolution + deep import -----------------------------------
@@ -66,11 +91,14 @@ let cached: ThatchCore | null = null;
 export async function loadThatchCore(): Promise<ThatchCore> {
   if (cached) return cached;
   const src = thatchSrcDir();
-  const [db, embeddings, git, prompts] = await Promise.all([
+  const [db, embeddings, git, prompts, queue, commands, skills] = await Promise.all([
     import(join(src, "db.ts")),
     import(join(src, "embeddings.ts")),
     import(join(src, "git.ts")),
     import(join(src, "prompts.ts")),
+    import(join(src, "extract-queue.ts")),
+    import(join(src, "commands.ts")),
+    import(join(src, "skills.ts")),
   ]);
   cached = {
     ThatchDB: db.ThatchDB,
@@ -80,6 +108,15 @@ export async function loadThatchCore(): Promise<ThatchCore> {
     recallNudge: prompts.recallNudge,
     predictionNudge: prompts.predictionNudge,
     behaviorNudge: prompts.behaviorNudge,
+    appendBatch: queue.appendBatch,
+    peekQueue: queue.peekQueue,
+    getMissedCount: queue.getMissedCount,
+    incrementMissedCount: queue.incrementMissedCount,
+    resetMissedCount: queue.resetMissedCount,
+    cursorInstructions: prompts.cursorInstructions,
+    mcpToolName: prompts.mcpToolName,
+    actionDefs: commands.actionDefs,
+    installSkills: skills.installSkills,
   };
   return cached;
 }
@@ -128,14 +165,22 @@ export class ThatchSession {
     const detected = await core.detectRepo(cfg.projectDir, core.repoPathCache(db));
     const repo = detected === "unknown" ? "global" : detected;
     const model = new core.BgeEmbeddingModel(cfg.modelName);
+    // De-duplicate stores while keeping the project store first, global second.
     const stores = repo === "global" ? ["global"] : [repo, "global"];
     return new ThatchSession(core, db, model, stores, cfg);
   }
 
   /**
+   * The prompt-aware recall + prediction + behavior nudge, mirroring thatch's
+   * opencode runtime. Returns the combined nudge text, or null when nothing
+   * fires. Best-effort: each sub-nudge is independently guarded.
+   */
+  /**
    * Proactive foundational recall, injected once at session start and again
    * after a compaction (mirrors opencode's session-start reminder and
-   * post-compaction re-familiarization). Returns null on a fresh store.
+   * post-compaction re-familiarization). Uses a standing query and a lower
+   * cutoff than the prompt-aware nudge, since it is deliberate rather than
+   * prompt-triggered. Returns null on a fresh/empty store (no noise).
    */
   async familiarize(): Promise<string | null> {
     let embedding: Float32Array;
@@ -163,11 +208,6 @@ export class ThatchSession {
     );
   }
 
-  /**
-   * The prompt-aware recall + prediction + behavior nudge, mirroring thatch's
-   * opencode runtime. Returns the combined nudge text, or null when nothing
-   * fires. Best-effort: each sub-nudge is independently guarded.
-   */
   async computeNudges(prompt: string): Promise<string | null> {
     if (prompt.trim().length < this.cfg.minPromptLen) return null;
     let embedding: Float32Array;
@@ -217,4 +257,134 @@ export class ThatchSession {
       /* ignore */
     }
   }
+}
+
+// --- Fact-extraction queue (file-backed, shared with the MCP server) ---------
+
+/**
+ * Buffers non-meta tool interactions for later fact extraction, reusing
+ * thatch's own `extract-queue`. The queue is keyed by `sessionId` and written
+ * under `$XDG_CACHE_HOME/thatch/queue`, the same location the thatch MCP
+ * server reads from `get_extraction_payload` - so the extension buffers and
+ * the agent (or an extraction child) drains, across processes.
+ *
+ * thatch's `appendBatch` filters meta tools (`mcp__thatch__*`, skill/task/
+ * agent) itself and self-drains the queue when it sees a `memory_remember`
+ * call, so feeding it every tool result reproduces opencode's drain-on-save.
+ */
+export class ExtractionBuffer {
+  constructor(
+    private readonly core: Pick<
+      ThatchCore,
+      "appendBatch" | "peekQueue" | "getMissedCount" | "incrementMissedCount" | "resetMissedCount"
+    >,
+    readonly sessionId: string,
+  ) {}
+
+  static async create(sessionId: string): Promise<ExtractionBuffer> {
+    return new ExtractionBuffer(await loadThatchCore(), sessionId);
+  }
+
+  buffer(toolName: string, input: Record<string, unknown>, response: string): void {
+    try {
+      this.core.appendBatch(this.sessionId, [
+        { tool_name: toolName, tool_input: input ?? {}, tool_response: response },
+      ]);
+    } catch {
+      /* best-effort */
+    }
+  }
+
+  count(): number {
+    try {
+      return this.core.peekQueue(this.sessionId).length;
+    } catch {
+      return 0;
+    }
+  }
+
+  missed(): number {
+    try {
+      return this.core.getMissedCount(this.sessionId);
+    } catch {
+      return 0;
+    }
+  }
+
+  bumpMissed(): void {
+    try {
+      this.core.incrementMissedCount(this.sessionId);
+    } catch {
+      /* best-effort */
+    }
+  }
+}
+
+/**
+ * Pi's extraction nudge. Unlike thatch's `extractionNudge` (which tells the
+ * model to spawn a background sub-agent - Pi has no such tool), this asks the
+ * agent to extract inline via the MCP tools, escalating with missed count.
+ */
+export function piExtractionNudge(count: number, missed: number, sessionId: string): string {
+  const plural = count === 1 ? "" : "s";
+  const steps =
+    `Call mcp__thatch__get_extraction_payload with session_id "${sessionId}" to retrieve them, ` +
+    `run the thatch-fact-extractor skill to distil durable facts, save each with ` +
+    `mcp__thatch__memory_remember, then call mcp__thatch__extraction_done with session_id "${sessionId}" ` +
+    `(even if nothing was worth saving).`;
+  if (missed >= 3) {
+    return (
+      `[thatch] YOU ARE IGNORING EXTRACTION. ${count} tool interaction${plural} are queued and unprocessed. ` +
+      `${steps} This is a system nudge, not user input.`
+    );
+  }
+  return (
+    `[thatch] ${count} tool interaction${plural} are queued for fact extraction. ${steps} ` +
+    `This is a system nudge, not user input - after extracting, continue with the user's request ` +
+    `(or keep waiting if nothing is pending).`
+  );
+}
+
+// --- Auto-provisioning (methodology / commands / skills) ---------------------
+
+/** The thatch methodology, flavored for Pi, for the system prompt. */
+export async function getMethodology(): Promise<string> {
+  const core = await loadThatchCore();
+  return core
+    .cursorInstructions()
+    .replace(/Cursor/g, "Pi")
+    .replace(/AGENTS\.md/g, "the Pi system prompt");
+}
+
+export interface PiCommand {
+  name: string;
+  description: string;
+  body: string;
+}
+
+/** The 6 shared action commands (opencode-only ones filtered out), MCP-spelled. */
+export async function getCommandDefs(): Promise<PiCommand[]> {
+  const core = await loadThatchCore();
+  return core
+    .actionDefs(core.mcpToolName)
+    .filter((d) => !d.opencodeOnly)
+    .map((d) => ({ name: d.name, description: d.description, body: d.body }));
+}
+
+/** Install thatch's skills into `dir` (idempotent). Returns the dir for resources_discover. */
+export async function provisionSkills(dir: string): Promise<string> {
+  const core = await loadThatchCore();
+  core.installSkills(dir);
+  return dir;
+}
+
+/** The task prompt handed to a background extraction child (PI_THATCH_EXTRACTION=background). */
+export function piExtractionChildPrompt(count: number, sessionId: string): string {
+  const plural = count === 1 ? "" : "s";
+  return (
+    `Extract durable facts from ${count} queued tool interaction${plural}. ` +
+    `Call mcp__thatch__get_extraction_payload with session_id "${sessionId}" to retrieve them, ` +
+    `run the thatch-fact-extractor skill, save durable facts with mcp__thatch__memory_remember, ` +
+    `then call mcp__thatch__extraction_done with session_id "${sessionId}" when finished.`
+  );
 }
