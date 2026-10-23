@@ -249,7 +249,7 @@ export default async function piThatch(pi: ExtensionAPI): Promise<void> {
       pendingFamiliarize = false;
       try {
         const fam = await session.familiarize();
-        if (fam) parts.push(fam);
+        if (fam.status === "ok" && fam.text) parts.push(fam.text);
       } catch (err) {
         debug(`familiarize failed: ${err}`);
       }

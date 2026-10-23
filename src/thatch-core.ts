@@ -11,13 +11,15 @@
  * Node, Pi's jiti extension loader transforms it).
  *
  * Two loaders, because two of thatch's modules are Bun-only:
- *   - loadProvisioning(): prompts / commands / skills / extract-queue. Plain
- *     Node code; backs methodology, commands, skills, extraction buffering.
+ *   - loadProvisioning(): prompts / commands / skills / extract-queue /
+ *     sideband. Plain Node code; backs methodology, commands, skills,
+ *     extraction buffering, and the sideband recall client.
  *   - loadStore(): db (bun:sqlite) / embeddings / git (Bun's `$`). Backs the
  *     in-process recall nudge; refuses to load when Pi is not running on Bun.
  */
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
+import { detectRepoNode } from "./repo.ts";
 
 // --- Minimal structural types for the thatch internals we touch -------------
 
@@ -82,7 +84,22 @@ export interface ProvisioningCore {
   mcpToolName: (name: string) => string;
   actionDefs: (tool: (name: string) => string) => ActionDef[];
   installSkills: (skillsDir: string) => unknown;
+  // sideband.ts: client for the thatch MCP server's warm-model socket. Each
+  // request resolves null on any failure (no server, timeout, bad reply).
+  sidebandSocketPath: (dbPath: string) => string;
+  sidebandMatch: SidebandCall<NudgeMatch>;
+  sidebandPredictions: SidebandCall<unknown>;
+  sidebandBehaviors: SidebandCall<unknown>;
 }
+
+type SidebandCall<T> = (
+  socketPath: string,
+  text: string,
+  stores: string[],
+  threshold: number,
+  limit: number,
+  timeoutMs?: number,
+) => Promise<T[] | null>;
 
 export interface ActionDef {
   name: string;
@@ -126,13 +143,14 @@ function memoize<T>(load: () => Promise<T>): () => Promise<T> {
 }
 
 // Imports are sequential in a fixed order so module evaluation order is the
-// same under ESM (Bun) and jiti (Node). Four awaits, once per process.
+// same under ESM (Bun) and jiti (Node). A few awaits, once per process.
 export const loadProvisioning: () => Promise<ProvisioningCore> = memoize(async () => {
   const src = thatchSrcDir();
   const prompts = await import(join(src, "prompts.ts"));
   const commands = await import(join(src, "commands.ts"));
   const skills = await import(join(src, "skills.ts"));
   const queue = await import(join(src, "extract-queue.ts"));
+  const sideband = await import(join(src, "sideband.ts"));
   return {
     claudeRecallNudge: prompts.claudeRecallNudge,
     predictionNudge: prompts.predictionNudge,
@@ -146,6 +164,10 @@ export const loadProvisioning: () => Promise<ProvisioningCore> = memoize(async (
     mcpToolName: prompts.mcpToolName,
     actionDefs: commands.actionDefs,
     installSkills: skills.installSkills,
+    sidebandSocketPath: sideband.sidebandSocketPath,
+    sidebandMatch: sideband.sidebandMatch,
+    sidebandPredictions: sideband.sidebandPredictions,
+    sidebandBehaviors: sideband.sidebandBehaviors,
   };
 });
 
@@ -238,9 +260,32 @@ export function familiarizeText(labels: string[]): string | null {
   );
 }
 
+// --- Recall providers ----------------------------------------------------------
+
+/**
+ * Re-familiarization outcome. "unavailable" means the answer could not be
+ * fetched (sideband absent or slow), so the caller should retry later;
+ * `ok` with null text means there is nothing to say (an empty store).
+ */
+export type FamiliarizeResult = { status: "ok"; text: string | null } | { status: "unavailable" };
+
+/** The ambient recall surface, implemented in-process (Bun) and over the sideband. */
+export interface RecallProvider {
+  readonly stores: string[];
+  familiarize(): Promise<FamiliarizeResult>;
+  computeNudges(prompt: string): Promise<string | null>;
+  dispose(): void;
+}
+
+/** Project store first, then global; "unknown" means global only. */
+function storesFor(detected: string): string[] {
+  const repo = detected === "unknown" ? "global" : detected;
+  return repo === "global" ? ["global"] : [repo, "global"];
+}
+
 // --- Session: in-process memory access for the ambient nudges ----------------
 
-export class ThatchSession {
+export class ThatchSession implements RecallProvider {
   private constructor(
     private readonly db: ThatchDBLike,
     private readonly model: EmbeddingModel,
@@ -254,10 +299,8 @@ export class ThatchSession {
     const cfg = resolveConfig(projectDir, env);
     const db = new store.ThatchDB(cfg.dbPath);
     const detected = await store.detectRepo(cfg.projectDir, store.repoPathCache(db));
-    const repo = detected === "unknown" ? "global" : detected;
     const model = new store.BgeEmbeddingModel(cfg.modelName);
-    // De-duplicate stores while keeping the project store first, global second.
-    const stores = repo === "global" ? ["global"] : [repo, "global"];
+    const stores = storesFor(detected);
     return new ThatchSession(db, model, stores, cfg);
   }
 
@@ -266,23 +309,25 @@ export class ThatchSession {
    * after a compaction (mirrors opencode's session-start reminder and
    * post-compaction re-familiarization). Uses a standing query and a lower
    * cutoff than the prompt-aware nudge, since it is deliberate rather than
-   * prompt-triggered. Returns null on a fresh/empty store (no noise).
+   * prompt-triggered. Null text on a fresh/empty store (no noise). Failures
+   * also report "ok" with null text: retrying an in-process model that failed
+   * to load on every turn would only repeat the cost.
    */
-  async familiarize(): Promise<string | null> {
+  async familiarize(): Promise<FamiliarizeResult> {
     let embedding: Float32Array;
     try {
       embedding = await this.model.queryEmbed(FAMILIARIZE_QUERY);
     } catch {
-      return null;
+      return { status: "ok", text: null };
     }
     let rows: MemoryRow[];
     try {
       rows = this.db.search(this.stores, embedding, { limit: FAMILIARIZE_SEARCH_LIMIT });
     } catch {
-      return null;
+      return { status: "ok", text: null };
     }
     const top = rows.filter((r) => r._score >= FAMILIARIZE_THRESHOLD).slice(0, FAMILIARIZE_KEEP);
-    return familiarizeText(top.map((r) => r.label));
+    return { status: "ok", text: familiarizeText(top.map((r) => r.label)) };
   }
 
   /**
@@ -334,6 +379,77 @@ export class ThatchSession {
     } catch {
       /* ignore */
     }
+  }
+}
+
+// --- Sideband recall: the same nudges, computed by the MCP server -------------
+
+/** thatch's own hook timeout for a sideband round-trip. */
+const SIDEBAND_TIMEOUT_MS = 2000;
+
+/**
+ * The recall surface without an in-process store: each request goes to the
+ * thatch MCP server Pi already runs, over the Unix socket thatch opens for
+ * exactly this (its Claude Code / Cursor hooks use the same client). The
+ * server embeds with its warm model and searches its DB; nothing Bun-only or
+ * model-sized loads in Pi's process, so this works on Node.
+ *
+ * The socket path is a hash of the DB path, and resolveConfig builds that
+ * path exactly as the MCP server does, so both sides find the same socket.
+ */
+export class SidebandRecall implements RecallProvider {
+  private constructor(
+    private readonly core: ProvisioningCore,
+    private readonly socketPath: string,
+    readonly stores: string[],
+    readonly cfg: ThatchConfig,
+    private readonly timeoutMs: number,
+  ) {}
+
+  static async create(
+    projectDir: string,
+    env: NodeJS.ProcessEnv = process.env,
+    opts: { timeoutMs?: number } = {},
+  ): Promise<SidebandRecall> {
+    const core = await loadProvisioning();
+    const cfg = resolveConfig(projectDir, env);
+    const stores = storesFor(await detectRepoNode(cfg.projectDir));
+    const socketPath = core.sidebandSocketPath(cfg.dbPath);
+    return new SidebandRecall(core, socketPath, stores, cfg, opts.timeoutMs ?? SIDEBAND_TIMEOUT_MS);
+  }
+
+  async familiarize(): Promise<FamiliarizeResult> {
+    const rows = await this.core.sidebandMatch(
+      this.socketPath,
+      FAMILIARIZE_QUERY,
+      this.stores,
+      FAMILIARIZE_THRESHOLD,
+      FAMILIARIZE_SEARCH_LIMIT,
+      this.timeoutMs,
+    );
+    if (rows === null) return { status: "unavailable" };
+    return { status: "ok", text: familiarizeText(rows.slice(0, FAMILIARIZE_KEEP).map((r) => r.label)) };
+  }
+
+  async computeNudges(prompt: string): Promise<string | null> {
+    if (prompt.trim().length < this.cfg.minPromptLen) return null;
+    const { socketPath, stores, cfg, timeoutMs } = this;
+    // One round-trip each, in parallel: a cold or absent server costs one
+    // timeout, not three. A null part means "skip it", like the in-process path.
+    const [matches, predictions, behaviors] = await Promise.all([
+      this.core.sidebandMatch(socketPath, prompt, stores, cfg.recallThreshold, NUDGE_LIMIT, timeoutMs),
+      this.core.sidebandPredictions(socketPath, prompt, stores, cfg.predictionThreshold, NUDGE_LIMIT, timeoutMs),
+      this.core.sidebandBehaviors(socketPath, prompt, stores, cfg.behaviorThreshold, NUDGE_LIMIT, timeoutMs),
+    ]);
+    return formatNudges({
+      matches: (matches ?? []).map((m) => ({ label: m.label, score: m.score })),
+      predictions: predictions ?? [],
+      behaviors: behaviors ?? [],
+    });
+  }
+
+  dispose(): void {
+    // Holds no resources: every request opens and closes its own connection.
   }
 }
 

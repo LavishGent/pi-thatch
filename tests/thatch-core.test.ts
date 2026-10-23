@@ -26,6 +26,10 @@ test("loadProvisioning exposes the Node-safe thatch internals", async () => {
   expect(typeof core.mcpToolName).toBe("function");
   expect(typeof core.actionDefs).toBe("function");
   expect(typeof core.installSkills).toBe("function");
+  expect(typeof core.sidebandSocketPath).toBe("function");
+  expect(typeof core.sidebandMatch).toBe("function");
+  expect(typeof core.sidebandPredictions).toBe("function");
+  expect(typeof core.sidebandBehaviors).toBe("function");
   // The boundary stays honest: nothing Bun-only leaks into the Node-safe side.
   expect("ThatchDB" in core).toBe(false);
   expect("detectRepo" in core).toBe(false);
@@ -109,6 +113,14 @@ test("resolveConfig mirrors thatch's env chain and defaults", () => {
   expect(cfg.minPromptLen).toBe(10);
 });
 
+// The sideband socket path is a hash of the DB path STRING, so resolveConfig
+// must build it exactly like thatch's MCP server (src/mcp.ts: template strings,
+// HOME ?? "/tmp", no path.join normalization) or the two sides miss each other.
+test("resolveConfig builds the DB path byte-for-byte like the MCP server", () => {
+  expect(resolveConfig("/p", { XDG_CONFIG_HOME: "/x/" } as NodeJS.ProcessEnv).dbPath).toBe("/x//thatch/thatch.db");
+  expect(resolveConfig("/p", {} as NodeJS.ProcessEnv).dbPath).toBe("/tmp/.config/thatch/thatch.db");
+});
+
 test("resolveConfig honors THATCH_PROJECT_DIR and THATCH_DB_PATH overrides", () => {
   const cfg = resolveConfig("/proj", {
     HOME: "/home/x",
@@ -131,7 +143,7 @@ test("computeNudges returns null for a too-short prompt", async () => {
     // A fresh store yields no matches even for a long prompt.
     expect(await session.computeNudges("tell me about the authentication architecture here")).toBeNull();
     // Re-familiarization is silent on an empty store.
-    expect(await session.familiarize()).toBeNull();
+    expect(await session.familiarize()).toEqual({ status: "ok", text: null });
   } finally {
     session.dispose();
   }
