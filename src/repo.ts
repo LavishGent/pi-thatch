@@ -6,6 +6,7 @@
  * cannot load on Node; this version runs git through node:child_process
  * instead. tests/repo.test.ts checks it against thatch's own functions on
  * every directory shape, so a drift in either fails loudly.
+ * thatch is MIT-licensed; its notice is in THIRD_PARTY_NOTICES.md.
  *
  * Deliberately omitted: thatch's repo-path cache. It recovers the identity of
  * a deleted worktree; a Pi session's cwd exists when the session starts, which
