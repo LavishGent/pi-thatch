@@ -16,8 +16,12 @@
  *
  * Event handlers get ExtensionContext (no executeTool), so ambient logic reads
  * thatch's store in-process; writes flow through the MCP tools (single writer).
- * Requires Pi under Bun (bun:sqlite); under Node it degrades to inert.
+ *
+ * Runs on Node or Bun. Everything above works on both; only the in-process
+ * store (recall nudge + re-familiarization) needs Bun (bun:sqlite) and is
+ * skipped on Node.
  */
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -307,23 +311,23 @@ export default async function piThatch(pi: ExtensionAPI): Promise<void> {
 
 /**
  * Fire-and-forget a background Pi session that drains the extraction queue.
- * Uses Bun.spawn (ExecOptions has no env) so PI_THATCH_CHILD marks the child
- * inert. The child shares THATCH_* env so it reads the same DB/queue.
+ * node:child_process works on Node and Bun (pi.exec has no env option), and
+ * PI_THATCH_CHILD=1 marks the child inert. The child shares THATCH_* env so it
+ * reads the same DB/queue. Default launcher: `pi-bun` under Bun (the shell
+ * alias is invisible to spawn), the plain `pi` on PATH under Node.
  */
 async function spawnExtractionChild(buffer: ExtractionBuffer, count: number, cwd: string): Promise<void> {
-  const bin = process.env.PI_THATCH_PI_BIN || "pi-bun";
+  const bin = process.env.PI_THATCH_PI_BIN || (isBunRuntime() ? "pi-bun" : "pi");
   const prompt = piExtractionChildPrompt(count, buffer.sessionId);
-  const spawn = (globalThis as { Bun?: { spawn: (cmd: string[], opts: unknown) => unknown } }).Bun?.spawn;
-  if (!spawn) {
-    debug("Bun.spawn unavailable; skipping background extraction");
-    return;
-  }
   debug(`spawning background extraction (${count} interactions) via ${bin}`);
-  spawn([bin, "-p", "--no-session", "--session-dir", tmpdir(), prompt], {
+  const child = spawn(bin, ["-p", "--no-session", "--session-dir", tmpdir(), prompt], {
     cwd,
     env: { ...process.env, PI_THATCH_CHILD: "1" },
-    stdin: "ignore",
-    stdout: "ignore",
-    stderr: "ignore",
+    stdio: "ignore",
+    detached: true,
   });
+  // A missing launcher (ENOENT) must never surface to the user; the queue
+  // simply stays for a later drain.
+  child.on("error", (err) => debug(`background extraction spawn failed: ${err}`));
+  child.unref();
 }
