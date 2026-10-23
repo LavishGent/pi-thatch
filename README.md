@@ -10,9 +10,9 @@ methodology, slash commands, skills, and the ambient "it remembers on its own"
 behaviors. You never edit a config file, and you never need to know what thatch
 is.
 
-> Runs **in-process under Bun** (via a `pi-bun` launcher). The ambient behaviors
-> load thatch's store and embedding model directly in Pi's process; there is no
-> separate daemon.
+> Runs on Pi's default **Node** launcher or under **Bun**. Under Bun the recall
+> nudge additionally loads thatch's store and embedding model in-process; there
+> is no separate daemon either way.
 
 ## Install
 
@@ -31,12 +31,25 @@ That's it. On first load the extension:
 
 ### Requirements
 
-- **Pi launched under Bun** (the in-process store uses `bun:sqlite`). Use a
-  `pi-bun` wrapper: `exec bun "$(command -v pi-launcher)" "$@"`. Under the plain
-  Node launcher the extension loads but goes inert (no crash).
-- `bun` and `bunx` on PATH.
+- `bun` and `bunx` on PATH (the thatch MCP server is a Bun program; Pi spawns
+  it with `bunx`). Pi itself may run on Node or Bun.
+- **Optional: Pi launched under Bun** for the automatic recall nudge and
+  re-familiarization, which read thatch's store in-process via `bun:sqlite`.
+  Use a `pi-bun` wrapper: `exec bun "$(command -v pi-launcher)" "$@"`.
 - First recall downloads thatch's embedding model once (~150 MB, cached
   per-user; skipped if already present from another thatch host).
+
+### Runtime matrix
+
+| Capability | Node launcher | Bun launcher |
+|---|---|---|
+| Memory tools (MCP), methodology, slash commands, skills | yes | yes |
+| Fact extraction (`off` / `nudge` / `background`) | yes | yes |
+| Desktop alerts | yes | yes |
+| Automatic recall / prediction / behavior nudge | no (the methodology instructs manual recall) | yes |
+| Session-start / post-compaction re-familiarization | no | yes |
+
+Node parity for the last two rows is tracked below (sideband client).
 
 ## What you get
 
@@ -44,8 +57,8 @@ That's it. On first load the extension:
 |---|---|
 | **Memory tools** | `mcp__thatch__*` — remember/recall/list/show/forget, stores, dedup, predictions, behaviors, config, notify, chat (29 tools) |
 | **Methodology** | thatch's "# Persistence" guidance appended to the system prompt: recall at session start, save durable findings, treat memories as pointers to verify |
-| **Recall nudge** | at each turn the prompt is embedded in-process and matched against your memories; relevant ones (plus predictions/behaviors) are injected automatically |
-| **Re-familiarization** | at session start and after every compaction, foundational memories are surfaced so the agent is never amnesiac |
+| **Recall nudge** (Bun) | at each turn the prompt is embedded in-process and matched against your memories; relevant ones (plus predictions/behaviors) are injected automatically |
+| **Re-familiarization** (Bun) | at session start and after every compaction, foundational memories are surfaced so the agent is never amnesiac |
 | **Fact extraction** | tool interactions are buffered; the agent is reminded (or a background child is spawned) to distil durable facts into memory |
 | **Slash commands** | `/reflect` `/defrag` `/hygiene` `/refine` `/self-review` `/peer-review` |
 | **Skills** | 36 thatch skills (code review, archaeology, memory workflows, writing) |
@@ -59,7 +72,7 @@ Everything works with no configuration. Optional knobs:
 |---|---|---|
 | `PI_THATCH_EXTRACTION` | `off` | `off` \| `nudge` \| `background` — proactive fact extraction |
 | `PI_THATCH_NOTIFY` | unset | `1` enables pause/done desktop notifications |
-| `PI_THATCH_PI_BIN` | `pi-bun` | launcher used for `background` extraction children |
+| `PI_THATCH_PI_BIN` | `pi-bun` under Bun, `pi` under Node | launcher used for `background` extraction children |
 | `PI_THATCH_DEBUG` | unset | `1` logs diagnostics to stderr |
 | `THATCH_DB_PATH` | `$XDG_CONFIG_HOME/thatch/thatch.db` | store location |
 | `THATCH_MODEL` | `Xenova/bge-small-en-v1.5` | embedding model |
@@ -78,7 +91,8 @@ the ambient behaviors from Pi's event hooks.
 
 ```bash
 bun install
-bun test           # seam smoke, provisioning, extraction, factory wiring
+bun test           # seam smoke, provisioning, extraction, factory wiring,
+                   # plus a real-Node run of the extension through Pi's loader (jiti)
 bunx tsc --noEmit  # typecheck
 ```
 
@@ -86,13 +100,17 @@ bunx tsc --noEmit  # typecheck
 
 **Done**
 - Auto-provisioning: MCP server, methodology, 6 commands, 36 skills — zero manual setup.
-- Recall / prediction / behavior nudge (in-process).
-- Session-start + post-compaction re-familiarization.
+- Runs on the default Node launcher: everything except the in-process recall nudge.
+- Recall / prediction / behavior nudge (in-process, Bun).
+- Session-start + post-compaction re-familiarization (Bun).
 - Fact extraction: buffering + drain-on-save + `nudge` mode + experimental `background` mode.
 - Pause/done desktop alerts (opt-in).
-- Verified end-to-end in real Pi under Bun.
+- Verified end-to-end in real Pi under Bun; Node path verified through Pi's extension loader in tests.
 
 **Not yet (tracked for full parity)**
+- **Node: automatic recall nudge + re-familiarization** via thatch's sideband
+  socket (the channel Claude Code and Cursor use), so Node users get parity
+  without `bun:sqlite`.
 - **Cross-session chat**: auto-register identity + wake on unread mail (needs
   identity reconciliation with the MCP-server process).
 - **Background extraction hardening**: tie the queue id to Pi's session id

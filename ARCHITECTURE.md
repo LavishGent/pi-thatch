@@ -12,9 +12,11 @@ a repo instead of relearning it from scratch.
 
 Two facts shaped the design:
 
-1. **Pi runs under Bun here**, and thatch is Bun-coupled (`bun:sqlite`). So the
-   extension can import thatch's internals *in-process* rather than shelling to
-   a daemon.
+1. **Pi loads extensions through jiti on every runtime**, and thatch's npm
+   package ships raw TypeScript. So the extension can import thatch's internals
+   *in-process* rather than shelling to a daemon, on Node or Bun. Only two
+   thatch modules are Bun-coupled (`db.ts` via `bun:sqlite`, `git.ts` via Bun's
+   `$`), and they are isolated behind their own loader.
 2. **Pi event handlers get `ExtensionContext`, which has no `executeTool`.** So
    the ambient behaviors cannot call MCP tools; they must read thatch's store
    directly in-process. Writes still go through the MCP tools, keeping a single
@@ -23,7 +25,7 @@ Two facts shaped the design:
 ## Three concerns, three mechanisms
 
 ```
-                       pi-thatch extension (Bun, in Pi's process)
+                       pi-thatch extension (Node or Bun, in Pi's process)
                        ┌──────────────────────────────────────────┐
   user installs  ───►  │  factory(pi):                             │
   one extension        │   registerMcpServer ─────────────► tools  │ ── bunx @jeffober/thatch mcp
@@ -57,16 +59,27 @@ place that reaches thatch's non-exported internals:
 
 - It resolves the package root from thatch's `.` entry
   (`require.resolve("@jeffober/thatch")` → `<root>/src/index.ts`).
-- It imports the core files by absolute path — `db.ts`, `embeddings.ts`,
-  `git.ts`, `prompts.ts`, `extract-queue.ts`, `commands.ts`, `skills.ts`. The
-  published package ships raw TypeScript, which Bun loads directly.
+- It imports the core files by absolute path. The published package ships raw
+  TypeScript; Bun loads it directly and Pi's jiti loader transforms it on Node.
+- Two independent, memoized loaders split the imports by runtime need:
+
+  | Loader | thatch modules | Runtime | Backs |
+  |---|---|---|---|
+  | `loadProvisioning()` | `prompts.ts`, `commands.ts`, `skills.ts`, `extract-queue.ts` | Node + Bun | methodology, commands, skills, `ExtractionBuffer`, nudge formatters |
+  | `loadStore()` | `db.ts`, `embeddings.ts`, `git.ts` | Bun only | `ThatchSession` (in-process recall, re-familiarization) |
+
+  `loadStore()` refuses to import anything when `isBunRuntime()` is false. Each
+  loader memoizes its in-flight promise so overlapping callers share one module
+  evaluation; under jiti a second concurrent import can otherwise observe a
+  half-initialized module. A rejected load is not cached.
 
 Everything is pinned to `@jeffober/thatch@0.2.9` and guarded by
-`tests/thatch-core.test.ts`, which asserts the imported symbols still exist. If
-a thatch upgrade moves them, that test fails loudly instead of the extension
-silently going quiet. The module re-exports a small, typed facade
-(`ThatchSession`, `ExtractionBuffer`, nudge/provisioning helpers) so the rest of
-the extension never touches thatch directly.
+`tests/thatch-core.test.ts`, which asserts each loader's symbols still exist
+(and that nothing Bun-only leaks into the provisioning side). If a thatch
+upgrade moves them, that test fails loudly instead of the extension silently
+going quiet. The module re-exports a small, typed facade (`ThatchSession`,
+`ExtractionBuffer`, nudge/provisioning helpers) so the rest of the extension
+never touches thatch directly.
 
 ## Provisioning (on extension load)
 
@@ -90,10 +103,13 @@ in place for the first session.
 
 ## Ambient behaviors
 
-### Recall + re-familiarization (the "it remembers" feel)
+### Recall + re-familiarization (the "it remembers" feel) — Bun only
 
 `ThatchSession` holds an in-process `ThatchDB` and a warm `BgeEmbeddingModel`,
-built on `session_start` (repo detected → project + global stores).
+built on `session_start` (repo detected → project + global stores). On Node,
+`session_start` skips it with one debug line and the methodology's "recall at
+session start" instruction carries the manual path; the sideband client planned
+for Node parity is tracked in the README.
 
 - **Recall nudge** (`context` hook, turn start): the user's prompt is embedded
   (`queryEmbed`) and run through `db.search` + `scorePredictionNudge` +
@@ -116,15 +132,18 @@ context that must not pollute history.
   queue when it sees `memory_remember`** — reproducing OpenCode's drain-on-save,
   because Pi fires `tool_result` for MCP tool calls too. The queue is file-backed
   under `$XDG_CACHE_HOME/thatch/queue`, keyed by session id, and therefore shared
-  with the MCP-server process.
+  with the MCP-server process. A result that lands while `session_start`'s build
+  is still in flight waits for the buffer instead of being dropped.
 - **`PI_THATCH_EXTRACTION`** chooses what happens with queued interactions:
   - `off` (default): buffer only; drains when the agent saves memories on its own.
   - `nudge`: inject a `[thatch]` extraction nudge at the next turn (escalating
     with a missed count) → the agent fetches the payload and saves. Spends
     main-context tokens (Claude/Cursor parity).
-  - `background`: on `agent_settled`, `Bun.spawn` an off-context Pi child
-    (`PI_THATCH_CHILD=1`, loop-guarded) to drain the queue — closest to
-    OpenCode's child-session extraction.
+  - `background`: on `agent_settled`, spawn (`node:child_process`, detached)
+    an off-context Pi child (`PI_THATCH_CHILD=1`, loop-guarded) to drain the
+    queue — closest to OpenCode's child-session extraction. The launcher is
+    `PI_THATCH_PI_BIN`, else `pi-bun` under Bun / `pi` under Node; a missing
+    launcher is logged, never surfaced.
 
 ### Alerts (opt-in)
 
@@ -136,9 +155,9 @@ bookkeeping. `ui_prompt_start` fires a "needs input" (pause) notification;
 ## Process & data model
 
 ```
-Pi (Bun) process                          thatch MCP subprocess (Bun)
+Pi (Node or Bun) process                  thatch MCP subprocess (Bun, via bunx)
 ├─ pi-thatch extension                     └─ serves mcp__thatch__* tools
-│   ├─ ThatchDB (read)  ───────┐              ├─ ThatchDB (read+write)  ──┐
+│   ├─ ThatchDB (read, Bun) ───┐              ├─ ThatchDB (read+write)  ──┐
 │   └─ ExtractionBuffer (write)│              └─ get_extraction_payload ──┤
 │        to queue files        │                                         │
 └──────────────────────────────┴── shared on disk ──────────────────────┘
@@ -154,8 +173,13 @@ Pi (Bun) process                          thatch MCP subprocess (Bun)
 
 ## Degradation & safety
 
-- Under the Node launcher, `bun:sqlite` is missing; `ThatchSession.create`
-  throws, is caught, and the extension goes inert (no nudges) — never crashes.
+- Under the Node launcher the in-process store is skipped up front
+  (`isBunRuntime()`), never attempted and caught: tools, methodology, commands,
+  skills, extraction, and alerts all work; only the automatic recall nudge and
+  re-familiarization are off. `tests/node-runtime.test.ts` proves this by
+  running the extension under real `node` through jiti, the loader Pi uses.
+- Under Bun, a store failure (for example a thatch upgrade breaking `db.ts`)
+  is isolated to the store loader: provisioning and buffering still work.
 - Every ambient path is wrapped best-effort: a model-load, search, or queue
   failure degrades to "no nudge," never an error to the user.
 - Background extraction children set `PI_THATCH_CHILD=1` so they do not buffer,
@@ -166,16 +190,22 @@ Pi (Bun) process                          thatch MCP subprocess (Bun)
 | File | Responsibility |
 |---|---|
 | `src/index.ts` | Extension factory: provisioning + all event hooks |
-| `src/thatch-core.ts` | Blast door + `ThatchSession`, `ExtractionBuffer`, nudge/provisioning helpers |
-| `tests/thatch-core.test.ts` | Seam smoke (pins the thatch internals), config, recall/familiarize |
+| `src/thatch-core.ts` | Blast door (`loadProvisioning` / `loadStore`) + `ThatchSession`, `ExtractionBuffer`, nudge/provisioning helpers |
+| `tests/thatch-core.test.ts` | Seam smoke (pins the thatch internals per loader), config, recall/familiarize |
 | `tests/extraction.test.ts` | Buffering, meta-filter, drain-on-save, nudge text |
-| `tests/extension.test.ts` | Provisioning + factory wiring + a simulated turn |
+| `tests/extension.test.ts` | Provisioning + factory wiring + a simulated turn (Bun) |
+| `tests/node-runtime.test.ts` + `tests/fixtures/node-load.mjs` | The same provisioning + a buffered turn under real Node via jiti |
 
 ## Key decisions
 
 - **In-process over MCP for ambient logic** — forced by Pi's handler context
-  lacking `executeTool`, and enabled by running under Bun. It also gives a warm
-  model and all 39 tool defs if needed later.
+  lacking `executeTool`. Provisioning and buffering are plain Node code and run
+  everywhere; the store read needs Bun. It also gives a warm model and all 39
+  tool defs if needed later.
+- **Two loaders, one runtime guard** — the Bun requirement is enforced in
+  exactly one place (`loadStore`), before any Bun-only import, so Node users
+  get everything that does not need the store and a thatch upgrade that breaks
+  the store cannot take provisioning down with it.
 - **Single writer** — only the MCP subprocess writes `thatch.db`; the extension
   reads and writes only the extraction queue. No two-writer contention.
 - **Reuse thatch's own generators** — methodology, command bodies, skills, nudge

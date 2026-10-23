@@ -1,7 +1,7 @@
 {
   "name": "pi-thatch",
   "version": "0.1.0",
-  "description": "Thatch persistent memory + methodology for the Pi coding agent (in-process, Bun).",
+  "description": "Thatch persistent memory + methodology for the Pi coding agent (Node or Bun; in-process recall under Bun).",
   "type": "module",
   "license": "MIT",
   "pi": {
