@@ -9,7 +9,8 @@
  *   - Skills:      installed to a cache dir and exposed via `resources_discover`.
  *
  * Plus the ambient behaviors that need event hooks:
- *   - Prompt-aware recall + prediction + behavior nudge (in-process).
+ *   - Prompt-aware recall + prediction + behavior nudge (in-process under
+ *     Bun; over the thatch MCP server's sideband socket on Node).
  *   - Session-start + post-compaction re-familiarization.
  *   - Fact extraction (buffer + drain-on-save + nudge / background).
  *   - Pause/done desktop alerts (opt-in).
@@ -17,9 +18,9 @@
  * Event handlers get ExtensionContext (no executeTool), so ambient logic reads
  * thatch's store in-process; writes flow through the MCP tools (single writer).
  *
- * Runs on Node or Bun. Everything above works on both; only the in-process
- * store (recall nudge + re-familiarization) needs Bun (bun:sqlite) and is
- * skipped on Node.
+ * Runs on Node or Bun. Everything above works on both. Under Bun the recall
+ * nudge reads thatch's store in-process (bun:sqlite); on Node, or if that
+ * store fails to load, it asks the MCP server's warm model over the sideband.
  */
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -40,6 +41,8 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
   ThatchSession,
+  SidebandRecall,
+  type RecallProvider,
   ExtractionBuffer,
   piExtractionNudge,
   piExtractionChildPrompt,
@@ -71,17 +74,41 @@ function debug(msg: string): void {
   if (process.env.PI_THATCH_DEBUG) console.error(`[pi-thatch] ${msg}`);
 }
 
+const MAX_FAMILIARIZE_ATTEMPTS = 5;
+
+/**
+ * The recall provider for this session: thatch's store in-process under Bun;
+ * otherwise, or if that store fails to load (a thatch upgrade breaking db.ts),
+ * the thatch MCP server's warm model over its sideband socket.
+ */
+async function createRecall(cwd: string): Promise<RecallProvider> {
+  if (isBunRuntime()) {
+    try {
+      return await ThatchSession.create(cwd);
+    } catch (err) {
+      debug(`in-process store init failed; recall via the thatch sideband instead: ${err}`);
+    }
+  } else {
+    debug("recall via the thatch sideband (Pi is running on Node)");
+  }
+  return SidebandRecall.create(cwd);
+}
+
 export default async function piThatch(pi: ExtensionAPI): Promise<void> {
   const isChild = !!process.env.PI_THATCH_CHILD;
   const mode: ExtractionMode = (process.env.PI_THATCH_EXTRACTION as ExtractionMode) || "off";
 
-  let session: ThatchSession | null = null;
+  let session: RecallProvider | null = null;
+  // Bumped by every session_start; a build that finishes after a newer
+  // session_start (resume / reload mid-build) is discarded, not installed.
+  let generation = 0;
   let building: Promise<void> | null = null;
   let bufferReady: Promise<void> | null = null;
   let buffer: ExtractionBuffer | null = null;
   let lastNudgedPrompt: string | null = null;
   let spawning = false;
   let pendingFamiliarize = false;
+  let familiarizeAttempts = 0;
   let toolsThisRun = 0;
 
   let methodology: string | null = null;
@@ -176,36 +203,37 @@ export default async function piThatch(pi: ExtensionAPI): Promise<void> {
   pi.on("session_start", (_e: SessionStartEvent, ctx) => {
     if (isChild) return;
     disposeSession();
+    const gen = ++generation;
     const sessionId = randomUUID();
-    // The buffer is Node-safe; the in-process store is Bun-only. Each is
-    // guarded on its own so a store failure never costs the buffer (or vice
-    // versa), and the Node case is a deliberate skip rather than a caught crash.
+    // The buffer and the recall provider are built independently, so a
+    // failure in one never costs the other.
     bufferReady = ExtractionBuffer.create(sessionId)
       .then((b) => {
-        buffer = b;
+        if (gen === generation) buffer = b;
       })
       .catch((err) => {
         debug(`extraction buffer init failed: ${err}`);
       });
-    let buildStore: Promise<void> = Promise.resolve();
-    if (isBunRuntime()) {
-      buildStore = ThatchSession.create(ctx.cwd)
-        .then((s) => {
-          session = s;
-          pendingFamiliarize = true;
-        })
-        .catch((err) => {
-          debug(`in-process store init failed (recall nudge off): ${err}`);
-        });
-    } else {
-      debug("in-process store skipped: Pi is running on Node (recall nudge off)");
-    }
-    building = Promise.all([bufferReady, buildStore]).then(() => undefined);
+    const buildRecall = createRecall(ctx.cwd)
+      .then((r) => {
+        if (gen !== generation) {
+          r.dispose();
+          return;
+        }
+        session = r;
+        pendingFamiliarize = true;
+        familiarizeAttempts = 0;
+      })
+      .catch((err) => {
+        debug(`recall init failed (recall nudge off): ${err}`);
+      });
+    building = Promise.all([bufferReady, buildRecall]).then(() => undefined);
   });
 
   pi.on("session_compact", (_e: SessionCompactEvent) => {
     if (isChild) return;
     pendingFamiliarize = true;
+    familiarizeAttempts = 0;
     lastNudgedPrompt = null;
   });
 
@@ -232,6 +260,30 @@ export default async function piThatch(pi: ExtensionAPI): Promise<void> {
     await notify("Pi needs your input", event.title ?? `${event.kind} prompt`);
   });
 
+  /**
+   * One re-familiarization attempt. "unavailable" (the sideband is not up yet,
+   * or slow) keeps it pending so the next user turn retries, up to
+   * MAX_FAMILIARIZE_ATTEMPTS per session start or compaction. An absent socket
+   * fails fast, so retries are cheap; the cap bounds a live but stuck server.
+   */
+  const familiarizeOnce = async (recall: RecallProvider): Promise<string | null> => {
+    familiarizeAttempts++;
+    try {
+      const res = await recall.familiarize();
+      if (res.status === "ok") {
+        pendingFamiliarize = false;
+        return res.text;
+      }
+    } catch (err) {
+      debug(`familiarize failed: ${err}`);
+    }
+    if (familiarizeAttempts >= MAX_FAMILIARIZE_ATTEMPTS) {
+      pendingFamiliarize = false;
+      debug(`re-familiarization unavailable after ${familiarizeAttempts} attempts; skipping until next compaction`);
+    }
+    return null;
+  };
+
   // Recall/prediction/behavior + re-familiarization + extraction nudge, injected
   // as ephemeral trailing context at the start of a user-driven turn.
   pi.on("context", async (event: ContextEvent) => {
@@ -244,27 +296,25 @@ export default async function piThatch(pi: ExtensionAPI): Promise<void> {
 
     const prompt = textOf(last as { content?: unknown });
     const parts: string[] = [];
+    const recall = session;
+    const freshPrompt = !!prompt && prompt !== lastNudgedPrompt;
+    if (freshPrompt) lastNudgedPrompt = prompt;
 
-    if (pendingFamiliarize && session) {
-      pendingFamiliarize = false;
-      try {
-        const fam = await session.familiarize();
-        if (fam.status === "ok" && fam.text) parts.push(fam.text);
-      } catch (err) {
-        debug(`familiarize failed: ${err}`);
-      }
-    }
+    // Familiarize and recall run concurrently: over the sideband, a cold or
+    // absent server then costs one timeout per turn instead of two.
+    const [fam, nudge] = await Promise.all([
+      pendingFamiliarize && recall ? familiarizeOnce(recall) : null,
+      freshPrompt && recall
+        ? recall.computeNudges(prompt).catch((err) => {
+            debug(`recall nudge failed: ${err}`);
+            return null;
+          })
+        : null,
+    ]);
+    if (fam) parts.push(fam);
+    if (nudge) parts.push(nudge);
 
-    if (prompt && prompt !== lastNudgedPrompt) {
-      lastNudgedPrompt = prompt;
-      if (session) {
-        try {
-          const nudge = await session.computeNudges(prompt);
-          if (nudge) parts.push(nudge);
-        } catch (err) {
-          debug(`recall nudge failed: ${err}`);
-        }
-      }
+    if (freshPrompt) {
       if (mode === "nudge" && buffer) {
         const count = buffer.count();
         if (count > 0) {

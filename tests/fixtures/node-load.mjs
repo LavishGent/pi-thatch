@@ -1,14 +1,21 @@
 // Loads the extension under plain Node the way Pi's extension loader does
-// (jiti, moduleCache off), drives one simulated turn against a mock
-// ExtensionAPI, and prints a JSON report. Run by tests/node-runtime.test.ts
-// with an isolated env (HOME, XDG_CACHE_HOME, THATCH_*); never imports Bun.
+// (jiti, moduleCache off), drives simulated turns against a mock ExtensionAPI,
+// and prints a JSON report. Run by tests/node-runtime.test.ts with an isolated
+// env (HOME, XDG_CACHE_HOME, THATCH_*); never imports Bun.
+//
+// PRE_TURNS (default 0): user turns to run BEFORE the thatch sideband server
+// starts, to exercise the "server not up yet" path. Then the fixture starts
+// thatch's real SidebandServer (fake model + DB) on the socket the MCP server
+// would own for THATCH_DB_PATH, and runs one more turn.
 import { existsSync } from "node:fs";
+import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
-const report = { runtime: typeof Bun === "undefined" ? "node" : "bun", errors: [] };
+const preTurns = Number(process.env.PRE_TURNS ?? "0");
+const report = { runtime: typeof Bun === "undefined" ? "node" : "bun", errors: [], turns: [] };
 
 const handlers = new Map();
 const commands = new Map();
@@ -25,6 +32,25 @@ const pi = {
   exec: async () => ({ stdout: "", stderr: "", code: 0 }),
 };
 
+// A stand-in for the MCP server's warm model and DB behind the real socket.
+const fakeModel = { queryEmbed: async () => new Float32Array([1, 0, 0]) };
+const fakeDb = {
+  search: (_stores, _e, opts) =>
+    [
+      { label: "architecture overview", store: "global", _score: 0.92 },
+      { label: "auth flow", store: "global", _score: 0.88 },
+    ].slice(0, opts.limit),
+  scorePredictionNudge: () => [],
+  scoreBehaviorNudge: () => [],
+};
+
+async function turn(text) {
+  const messages = [{ role: "user", content: [{ type: "text", text }] }];
+  const out = await handlers.get("context")({ type: "context", messages });
+  report.turns.push(out ? out.messages[out.messages.length - 1].content[0].text : null);
+}
+
+let server;
 try {
   const jiti = createJiti(import.meta.url, { moduleCache: false });
   const factory = await jiti.import(join(root, "src", "index.ts"), { default: true });
@@ -53,16 +79,23 @@ try {
     content: [{ type: "text", text: "file contents" }],
   });
 
-  const messages = [
-    { role: "user", content: [{ type: "text", text: "explain the authentication architecture of this project" }] },
-  ];
-  const out = await handlers.get("context")({ type: "context", messages });
-  report.injected = out ? out.messages[out.messages.length - 1].content[0].text : null;
+  for (let i = 0; i < preTurns; i++) await turn(`before the server is up, question number ${i}`);
+
+  const require = createRequire(join(root, "src", "index.ts"));
+  const sideband = await jiti.import(join(dirname(require.resolve("@jeffober/thatch")), "sideband.ts"));
+  const sock = sideband.sidebandSocketPath(process.env.THATCH_DB_PATH);
+  server = new sideband.SidebandServer(sock, fakeModel, fakeDb);
+  server.start();
+  for (let i = 0; i < 100 && !existsSync(sock); i++) await new Promise((r) => setTimeout(r, 10));
+
+  await turn("explain the authentication architecture of this project");
 
   await handlers.get("agent_settled")({ type: "agent_settled", aborted: false }, { cwd: root });
   handlers.get("session_shutdown")({ type: "session_shutdown", reason: "quit" });
 } catch (err) {
   report.errors.push(String(err?.stack ?? err));
+} finally {
+  server?.stop();
 }
 
 process.stdout.write(JSON.stringify(report));
