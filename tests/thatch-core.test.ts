@@ -2,24 +2,45 @@ import { test, expect } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadThatchCore, resolveConfig, ThatchSession } from "../src/thatch-core.ts";
+import { isBunRuntime, loadProvisioning, loadStore, resolveConfig, ThatchSession } from "../src/thatch-core.ts";
 
 // Seam smoke: proves the deep imports into thatch's non-exported internals
 // resolve and still export the symbols we depend on. If a thatch upgrade moves
 // these, this fails loudly instead of the extension silently going quiet.
-test("loadThatchCore exposes the expected thatch internals", async () => {
-  const core = await loadThatchCore();
-  expect(typeof core.ThatchDB).toBe("function");
-  expect(typeof core.BgeEmbeddingModel).toBe("function");
-  expect(typeof core.detectRepo).toBe("function");
-  expect(typeof core.repoPathCache).toBe("function");
+test("loadProvisioning exposes the Node-safe thatch internals", async () => {
+  const core = await loadProvisioning();
   expect(typeof core.recallNudge).toBe("function");
   expect(typeof core.predictionNudge).toBe("function");
   expect(typeof core.behaviorNudge).toBe("function");
+  expect(typeof core.appendBatch).toBe("function");
+  expect(typeof core.peekQueue).toBe("function");
+  expect(typeof core.cursorInstructions).toBe("function");
+  expect(typeof core.mcpToolName).toBe("function");
+  expect(typeof core.actionDefs).toBe("function");
+  expect(typeof core.installSkills).toBe("function");
+  // The boundary stays honest: nothing Bun-only leaks into the Node-safe side.
+  expect("ThatchDB" in core).toBe(false);
+  expect("detectRepo" in core).toBe(false);
+});
+
+test("loadStore exposes the Bun-only thatch internals", async () => {
+  expect(isBunRuntime()).toBe(true);
+  const store = await loadStore();
+  expect(typeof store.ThatchDB).toBe("function");
+  expect(typeof store.repoPathCache).toBe("function");
+  expect(typeof store.BgeEmbeddingModel).toBe("function");
+  expect(typeof store.detectRepo).toBe("function");
+});
+
+test("concurrent loader calls share one load", async () => {
+  const [a, b] = await Promise.all([loadProvisioning(), loadProvisioning()]);
+  expect(a).toBe(b);
+  const [c, d] = await Promise.all([loadStore(), loadStore()]);
+  expect(c).toBe(d);
 });
 
 test("recallNudge renders thatch's nudge text", async () => {
-  const core = await loadThatchCore();
+  const core = await loadProvisioning();
   const text = core.recallNudge([{ label: "auth flow", score: 0.9 }]);
   expect(text).toContain("[thatch]");
   expect(text).toContain("memory");

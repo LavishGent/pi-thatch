@@ -7,7 +7,14 @@
  * thatch's package `exports` only expose "." and "./tui", so bare subpath
  * imports (`@jeffober/thatch/src/db`) are blocked. We resolve the package
  * root from its "." entry and import the core files by absolute path, which
- * the published package ships as raw TypeScript (Bun loads it directly).
+ * the published package ships as raw TypeScript (Bun loads it directly; under
+ * Node, Pi's jiti extension loader transforms it).
+ *
+ * Two loaders, because two of thatch's modules are Bun-only:
+ *   - loadProvisioning(): prompts / commands / skills / extract-queue. Plain
+ *     Node code; backs methodology, commands, skills, extraction buffering.
+ *   - loadStore(): db (bun:sqlite) / embeddings / git (Bun's `$`). Backs the
+ *     in-process recall nudge; refuses to load when Pi is not running on Bun.
  */
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
@@ -49,11 +56,16 @@ export interface BatchToolCall {
   tool_response: string | unknown[];
 }
 
-interface ThatchCore {
+/** Bun-only internals: the SQLite store, the embedding model, repo detection. */
+export interface StoreCore {
   ThatchDB: new (dbPath: string, opts?: unknown) => ThatchDBLike;
   repoPathCache: (db: ThatchDBLike) => unknown;
   BgeEmbeddingModel: new (modelName: string) => EmbeddingModel;
   detectRepo: (projectDir: string, cache: unknown) => Promise<string>;
+}
+
+/** Node-safe internals: nudge text, extraction queue, methodology, commands, skills. */
+export interface ProvisioningCore {
   recallNudge: (matches: NudgeMatch[]) => string;
   predictionNudge: (items: unknown[]) => string;
   behaviorNudge: (items: unknown[]) => string;
@@ -86,25 +98,40 @@ function thatchSrcDir(): string {
   return dirname(entry); // <root>/src
 }
 
-let cached: ThatchCore | null = null;
+/** True when Pi is running on Bun (bun:sqlite and Bun's `$` are available). */
+export function isBunRuntime(): boolean {
+  return typeof Bun !== "undefined";
+}
 
-export async function loadThatchCore(): Promise<ThatchCore> {
-  if (cached) return cached;
+/**
+ * Memoizes the in-flight promise, not just the result, so overlapping callers
+ * share one evaluation of each module. Under Node, Pi loads extensions through
+ * jiti, whose CJS-style evaluation can hand a second concurrent importer a
+ * partially initialized module; one shared load avoids that. A rejected load
+ * is not cached, so the next call retries instead of reusing a broken module.
+ */
+function memoize<T>(load: () => Promise<T>): () => Promise<T> {
+  let inflight: Promise<T> | null = null;
+  return () => {
+    if (!inflight) {
+      inflight = load().catch((err) => {
+        inflight = null;
+        throw err;
+      });
+    }
+    return inflight;
+  };
+}
+
+// Imports are sequential in a fixed order so module evaluation order is the
+// same under ESM (Bun) and jiti (Node). Four awaits, once per process.
+export const loadProvisioning: () => Promise<ProvisioningCore> = memoize(async () => {
   const src = thatchSrcDir();
-  const [db, embeddings, git, prompts, queue, commands, skills] = await Promise.all([
-    import(join(src, "db.ts")),
-    import(join(src, "embeddings.ts")),
-    import(join(src, "git.ts")),
-    import(join(src, "prompts.ts")),
-    import(join(src, "extract-queue.ts")),
-    import(join(src, "commands.ts")),
-    import(join(src, "skills.ts")),
-  ]);
-  cached = {
-    ThatchDB: db.ThatchDB,
-    repoPathCache: db.repoPathCache,
-    BgeEmbeddingModel: embeddings.BgeEmbeddingModel,
-    detectRepo: git.detectRepo,
+  const prompts = await import(join(src, "prompts.ts"));
+  const commands = await import(join(src, "commands.ts"));
+  const skills = await import(join(src, "skills.ts"));
+  const queue = await import(join(src, "extract-queue.ts"));
+  return {
     recallNudge: prompts.recallNudge,
     predictionNudge: prompts.predictionNudge,
     behaviorNudge: prompts.behaviorNudge,
@@ -118,8 +145,25 @@ export async function loadThatchCore(): Promise<ThatchCore> {
     actionDefs: commands.actionDefs,
     installSkills: skills.installSkills,
   };
-  return cached;
-}
+});
+
+export const loadStore: () => Promise<StoreCore> = memoize(async () => {
+  // Refuse before importing: a failed `bun:sqlite` import under jiti can leave
+  // a half-built module behind, and there is nothing to gain by trying.
+  if (!isBunRuntime()) {
+    throw new Error("thatch's in-process store needs Bun (bun:sqlite); Pi is running on Node");
+  }
+  const src = thatchSrcDir();
+  const db = await import(join(src, "db.ts"));
+  const embeddings = await import(join(src, "embeddings.ts"));
+  const git = await import(join(src, "git.ts"));
+  return {
+    ThatchDB: db.ThatchDB,
+    repoPathCache: db.repoPathCache,
+    BgeEmbeddingModel: embeddings.BgeEmbeddingModel,
+    detectRepo: git.detectRepo,
+  };
+});
 
 // --- Config (mirrors thatch's own env chain) ---------------------------------
 
@@ -151,20 +195,22 @@ export function resolveConfig(projectDir: string, env: NodeJS.ProcessEnv = proce
 
 export class ThatchSession {
   private constructor(
-    private readonly core: ThatchCore,
+    private readonly core: Pick<ProvisioningCore, "recallNudge" | "predictionNudge" | "behaviorNudge">,
     private readonly db: ThatchDBLike,
     private readonly model: EmbeddingModel,
     readonly stores: string[],
     readonly cfg: ThatchConfig,
   ) {}
 
+  /** Bun only: throws (before touching the store) when Pi runs on Node. */
   static async create(projectDir: string, env: NodeJS.ProcessEnv = process.env): Promise<ThatchSession> {
-    const core = await loadThatchCore();
+    const store = await loadStore();
+    const core = await loadProvisioning();
     const cfg = resolveConfig(projectDir, env);
-    const db = new core.ThatchDB(cfg.dbPath);
-    const detected = await core.detectRepo(cfg.projectDir, core.repoPathCache(db));
+    const db = new store.ThatchDB(cfg.dbPath);
+    const detected = await store.detectRepo(cfg.projectDir, store.repoPathCache(db));
     const repo = detected === "unknown" ? "global" : detected;
-    const model = new core.BgeEmbeddingModel(cfg.modelName);
+    const model = new store.BgeEmbeddingModel(cfg.modelName);
     // De-duplicate stores while keeping the project store first, global second.
     const stores = repo === "global" ? ["global"] : [repo, "global"];
     return new ThatchSession(core, db, model, stores, cfg);
@@ -275,14 +321,14 @@ export class ThatchSession {
 export class ExtractionBuffer {
   constructor(
     private readonly core: Pick<
-      ThatchCore,
+      ProvisioningCore,
       "appendBatch" | "peekQueue" | "getMissedCount" | "incrementMissedCount" | "resetMissedCount"
     >,
     readonly sessionId: string,
   ) {}
 
   static async create(sessionId: string): Promise<ExtractionBuffer> {
-    return new ExtractionBuffer(await loadThatchCore(), sessionId);
+    return new ExtractionBuffer(await loadProvisioning(), sessionId);
   }
 
   buffer(toolName: string, input: Record<string, unknown>, response: string): void {
@@ -349,7 +395,7 @@ export function piExtractionNudge(count: number, missed: number, sessionId: stri
 
 /** The thatch methodology, flavored for Pi, for the system prompt. */
 export async function getMethodology(): Promise<string> {
-  const core = await loadThatchCore();
+  const core = await loadProvisioning();
   return core
     .cursorInstructions()
     .replace(/Cursor/g, "Pi")
@@ -364,7 +410,7 @@ export interface PiCommand {
 
 /** The 6 shared action commands (opencode-only ones filtered out), MCP-spelled. */
 export async function getCommandDefs(): Promise<PiCommand[]> {
-  const core = await loadThatchCore();
+  const core = await loadProvisioning();
   return core
     .actionDefs(core.mcpToolName)
     .filter((d) => !d.opencodeOnly)
@@ -373,7 +419,7 @@ export async function getCommandDefs(): Promise<PiCommand[]> {
 
 /** Install thatch's skills into `dir` (idempotent). Returns the dir for resources_discover. */
 export async function provisionSkills(dir: string): Promise<string> {
-  const core = await loadThatchCore();
+  const core = await loadProvisioning();
   core.installSkills(dir);
   return dir;
 }
