@@ -2,8 +2,10 @@
 
 Persistent cross-session memory and an operational methodology for the
 [Pi](https://pi.dev) coding agent, powered by
-[thatch](https://github.com/sysread/thatch) — with **parity to thatch's
-OpenCode plugin**.
+[thatch](https://github.com/sysread/thatch).
+
+pi-thatch is an independent Pi integration for thatch. thatch itself is
+written and maintained by Jeff Ober; pi-thatch is not affiliated with it.
 
 Install one extension. It provisions everything automatically — memory tools,
 methodology, slash commands, skills, and the ambient "it remembers on its own"
@@ -18,8 +20,10 @@ is.
 ## Install
 
 ```bash
-pi install github.com/LavishGent/pi-thatch     # or a local path
+pi install npm:pi-thatch
 ```
+
+Try it for one session without installing: `pi -e npm:pi-thatch`.
 
 That's it. On first load the extension:
 
@@ -34,8 +38,13 @@ That's it. On first load the extension:
 
 - `bun` and `bunx` on PATH (the thatch MCP server is a Bun program; Pi spawns
   it with `bunx`). Pi itself may run on Node or Bun.
-- First recall downloads thatch's embedding model once (~150 MB, cached
-  per-user; skipped if already present from another thatch host).
+- Node 22.19 or newer (Pi's own requirement).
+- The thatch MCP server downloads its embedding model once (about 130 MB,
+  cached per user and shared with any other thatch host on the machine).
+
+Memories live in thatch's database (`~/.config/thatch/thatch.db` by default),
+the same one thatch's Claude Code, Cursor, and OpenCode hosts use, so existing
+thatch memories carry over.
 
 ### Runtime differences
 
@@ -94,34 +103,26 @@ bun test           # seam smoke, provisioning, extraction, factory wiring,
 bunx tsc --noEmit  # typecheck
 ```
 
-## Status
+## Known limitations
 
-**Done**
-- Auto-provisioning: MCP server, methodology, 6 commands, 36 skills — zero manual setup.
-- Runs on the default Node launcher with full parity: recall goes through the
-  thatch MCP server's sideband socket (Bun: in-process).
-- Recall / prediction / behavior nudge, naming the tool spellings Pi exposes.
-- Session-start + post-compaction re-familiarization.
-- Fact extraction: buffering + drain-on-save + `nudge` mode + experimental `background` mode.
-- Pause/done desktop alerts (opt-in).
-- Verified end-to-end in real Pi under Bun; Node path verified through Pi's extension loader in tests.
+- **Several Pi sessions on one database (Node):** every session's thatch MCP
+  server binds the same sideband socket path. When the newest one exits, the
+  other sessions lose automatic recall until one of them restarts. The memory
+  tools keep working. The fix is planned upstream; see
+  [ROADMAP.md](ROADMAP.md).
+- **Not yet available in Pi:** thatch's cross-session chat wake-ups,
+  conversation search, and watchers (OpenCode-only in thatch today).
+- `background` extraction is experimental.
 
-**Not yet (tracked for full parity)**
-- **One recall path**: make the sideband the default under Bun too and retire
-  the in-process store (saves the second model load).
-- **Shared-DB sessions**: every Pi session's MCP server binds the same sideband
-  socket path; when the newest exits, the others lose sideband recall until
-  restart (a thatch-level limitation; needs an upstream change).
-- **Cross-session chat**: auto-register identity + wake on unread mail (needs
-  identity reconciliation with the MCP-server process).
-- **Background extraction hardening**: tie the queue id to Pi's session id
-  (survive resume); integration-test the child loop.
-- **Extraction feedback**: surface "new: N, updated: M" after a run.
-- **Conversation search** and **watchers** (OpenCode-only; reimplement against
-  Pi's session store / `gh`).
-- **Upstream** a `pi` host + `thatch setup --pi` so thatch owns provisioning and
-  the deep-import coupling retires.
+See [ROADMAP.md](ROADMAP.md) for what is planned and why, and
+[CHANGELOG.md](CHANGELOG.md) for release notes.
+
+## Credits
+
+[thatch](https://github.com/sysread/thatch) by Jeff Ober provides the memory
+engine, MCP server, methodology, commands, and skills; pi-thatch connects them
+to Pi. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## License
 
-MIT
+MIT. See [LICENSE](LICENSE).
