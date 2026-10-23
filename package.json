@@ -1,9 +1,40 @@
 {
   "name": "pi-thatch",
   "version": "0.1.0",
-  "description": "Thatch persistent memory + methodology for the Pi coding agent (Node or Bun).",
+  "description": "Persistent cross-session memory and methodology for the Pi coding agent, powered by thatch.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "pi-coding-agent",
+    "thatch",
+    "memory",
+    "mcp",
+    "ai"
+  ],
   "type": "module",
   "license": "MIT",
+  "author": {
+    "name": "Darrell Davis",
+    "url": "https://github.com/LavishGent"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LavishGent/pi-thatch.git"
+  },
+  "bugs": {
+    "url": "https://github.com/LavishGent/pi-thatch/issues"
+  },
+  "homepage": "https://github.com/LavishGent/pi-thatch#readme",
+  "files": [
+    "src/",
+    "README.md",
+    "ARCHITECTURE.md",
+    "ROADMAP.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
   "pi": {
     "extensions": [
       "./src/index.ts"
@@ -12,12 +43,24 @@
   "exports": {
     ".": "./src/index.ts"
   },
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "scripts": {
     "test": "bun test",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "bun test && tsc --noEmit"
   },
   "dependencies": {
     "@jeffober/thatch": "0.2.9"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^1.2.0",
