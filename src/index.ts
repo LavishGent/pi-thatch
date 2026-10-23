@@ -73,6 +73,7 @@ export default async function piThatch(pi: ExtensionAPI): Promise<void> {
 
   let session: ThatchSession | null = null;
   let building: Promise<void> | null = null;
+  let bufferReady: Promise<void> | null = null;
   let buffer: ExtractionBuffer | null = null;
   let lastNudgedPrompt: string | null = null;
   let spawning = false;
@@ -145,6 +146,7 @@ export default async function piThatch(pi: ExtensionAPI): Promise<void> {
     } finally {
       session = null;
       building = null;
+      bufferReady = null;
       buffer = null;
       lastNudgedPrompt = null;
     }
@@ -174,7 +176,7 @@ export default async function piThatch(pi: ExtensionAPI): Promise<void> {
     // The buffer is Node-safe; the in-process store is Bun-only. Each is
     // guarded on its own so a store failure never costs the buffer (or vice
     // versa), and the Node case is a deliberate skip rather than a caught crash.
-    const buildBuffer = ExtractionBuffer.create(sessionId)
+    bufferReady = ExtractionBuffer.create(sessionId)
       .then((b) => {
         buffer = b;
       })
@@ -194,7 +196,7 @@ export default async function piThatch(pi: ExtensionAPI): Promise<void> {
     } else {
       debug("in-process store skipped: Pi is running on Node (recall nudge off)");
     }
-    building = Promise.all([buildBuffer, buildStore]).then(() => undefined);
+    building = Promise.all([bufferReady, buildStore]).then(() => undefined);
   });
 
   pi.on("session_compact", (_e: SessionCompactEvent) => {
@@ -207,9 +209,12 @@ export default async function piThatch(pi: ExtensionAPI): Promise<void> {
     toolsThisRun = 0;
   });
 
-  pi.on("tool_result", (event: ToolResultEvent) => {
+  pi.on("tool_result", async (event: ToolResultEvent) => {
     if (isChild) return;
     toolsThisRun++;
+    // A tool result can land while session_start's build is still in flight;
+    // wait for the (fast, Node-safe) buffer rather than dropping the interaction.
+    if (!buffer && bufferReady) await bufferReady;
     if (!buffer) return;
     try {
       buffer.buffer(event.toolName, (event.input ?? {}) as Record<string, unknown>, textOf(event));
