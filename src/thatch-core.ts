@@ -66,9 +66,11 @@ export interface StoreCore {
 
 /** Node-safe internals: nudge text, extraction queue, methodology, commands, skills. */
 export interface ProvisioningCore {
-  recallNudge: (matches: NudgeMatch[]) => string;
-  predictionNudge: (items: unknown[]) => string;
-  behaviorNudge: (items: unknown[]) => string;
+  // prompts.ts nudge formatters. claudeRecallNudge is thatch's MCP-host recall
+  // nudge (bare `memory_recall`); the other two take a tool namer.
+  claudeRecallNudge: (matches: NudgeMatch[]) => string;
+  predictionNudge: (items: unknown[], tool?: (name: string) => string) => string;
+  behaviorNudge: (items: unknown[], tool?: (name: string) => string) => string;
   // extract-queue.ts (file-backed, shared with the thatch MCP server process)
   appendBatch: (sessionID: string, toolCalls: BatchToolCall[]) => void;
   peekQueue: (sessionID: string) => unknown[];
@@ -132,7 +134,7 @@ export const loadProvisioning: () => Promise<ProvisioningCore> = memoize(async (
   const skills = await import(join(src, "skills.ts"));
   const queue = await import(join(src, "extract-queue.ts"));
   return {
-    recallNudge: prompts.recallNudge,
+    claudeRecallNudge: prompts.claudeRecallNudge,
     predictionNudge: prompts.predictionNudge,
     behaviorNudge: prompts.behaviorNudge,
     appendBatch: queue.appendBatch,
@@ -191,11 +193,55 @@ export function resolveConfig(projectDir: string, env: NodeJS.ProcessEnv = proce
   };
 }
 
+// --- Nudge text (shared by every recall path) ---------------------------------
+
+/** Max memories / predictions / behaviors per nudge (thatch's hook default). */
+const NUDGE_LIMIT = 5;
+/** Re-familiarization: a deliberate standing query, so a lower cutoff. */
+export const FAMILIARIZE_QUERY = "project architecture, conventions, decisions, and user preferences";
+export const FAMILIARIZE_THRESHOLD = 0.3;
+/** Search one extra row, keep five: the cut thatch's opencode reminder uses. */
+export const FAMILIARIZE_SEARCH_LIMIT = 6;
+export const FAMILIARIZE_KEEP = 5;
+
+export interface NudgeResults {
+  matches: NudgeMatch[];
+  predictions: unknown[];
+  behaviors: unknown[];
+}
+
+/**
+ * The combined recall + prediction + behavior nudge, or null when nothing
+ * fires. Uses the formatters thatch's own MCP-host hook (`flush-tools`) uses:
+ * the bare `memory_recall` name the methodology teaches, and `mcp__thatch__*`
+ * in the prediction/behavior footers. thatch's opencode formatters would name
+ * `thatch_*` tools, which do not exist in Pi.
+ */
+export async function formatNudges(results: NudgeResults): Promise<string | null> {
+  const core = await loadProvisioning();
+  const parts: string[] = [];
+  if (results.matches.length > 0) parts.push(core.claudeRecallNudge(results.matches));
+  if (results.predictions.length > 0) parts.push(core.predictionNudge(results.predictions, core.mcpToolName));
+  if (results.behaviors.length > 0) parts.push(core.behaviorNudge(results.behaviors, core.mcpToolName));
+  return parts.length > 0 ? parts.join("\n\n") : null;
+}
+
+/** The session-start / post-compaction reminder line, or null when no labels. */
+export function familiarizeText(labels: string[]): string | null {
+  if (labels.length === 0) return null;
+  const quoted = labels.map((l) => `"${l}"`).join(", ");
+  const word = labels.length === 1 ? "memory" : "memories";
+  return (
+    `[thatch] Session context: ${labels.length} foundational ${word} exist for this project ` +
+    `(${quoted}). Recall what you need with mcp__thatch__memory_recall before proceeding - ` +
+    `memories are pointers, verify against source. This is a system note, not user input.`
+  );
+}
+
 // --- Session: in-process memory access for the ambient nudges ----------------
 
 export class ThatchSession {
   private constructor(
-    private readonly core: Pick<ProvisioningCore, "recallNudge" | "predictionNudge" | "behaviorNudge">,
     private readonly db: ThatchDBLike,
     private readonly model: EmbeddingModel,
     readonly stores: string[],
@@ -205,7 +251,6 @@ export class ThatchSession {
   /** Bun only: throws (before touching the store) when Pi runs on Node. */
   static async create(projectDir: string, env: NodeJS.ProcessEnv = process.env): Promise<ThatchSession> {
     const store = await loadStore();
-    const core = await loadProvisioning();
     const cfg = resolveConfig(projectDir, env);
     const db = new store.ThatchDB(cfg.dbPath);
     const detected = await store.detectRepo(cfg.projectDir, store.repoPathCache(db));
@@ -213,14 +258,9 @@ export class ThatchSession {
     const model = new store.BgeEmbeddingModel(cfg.modelName);
     // De-duplicate stores while keeping the project store first, global second.
     const stores = repo === "global" ? ["global"] : [repo, "global"];
-    return new ThatchSession(core, db, model, stores, cfg);
+    return new ThatchSession(db, model, stores, cfg);
   }
 
-  /**
-   * The prompt-aware recall + prediction + behavior nudge, mirroring thatch's
-   * opencode runtime. Returns the combined nudge text, or null when nothing
-   * fires. Best-effort: each sub-nudge is independently guarded.
-   */
   /**
    * Proactive foundational recall, injected once at session start and again
    * after a compaction (mirrors opencode's session-start reminder and
@@ -231,28 +271,25 @@ export class ThatchSession {
   async familiarize(): Promise<string | null> {
     let embedding: Float32Array;
     try {
-      embedding = await this.model.queryEmbed(
-        "project architecture, conventions, decisions, and user preferences",
-      );
+      embedding = await this.model.queryEmbed(FAMILIARIZE_QUERY);
     } catch {
       return null;
     }
     let rows: MemoryRow[];
     try {
-      rows = this.db.search(this.stores, embedding, { limit: 6 });
+      rows = this.db.search(this.stores, embedding, { limit: FAMILIARIZE_SEARCH_LIMIT });
     } catch {
       return null;
     }
-    const top = rows.filter((r) => r._score >= 0.3).slice(0, 5);
-    if (top.length === 0) return null;
-    const labels = top.map((r) => `"${r.label}"`).join(", ");
-    const word = top.length === 1 ? "memory" : "memories";
-    return (
-      `[thatch] Session context: ${top.length} foundational ${word} exist for this project ` +
-      `(${labels}). Recall what you need with mcp__thatch__memory_recall before proceeding - ` +
-      `memories are pointers, verify against source. This is a system note, not user input.`
-    );
+    const top = rows.filter((r) => r._score >= FAMILIARIZE_THRESHOLD).slice(0, FAMILIARIZE_KEEP);
+    return familiarizeText(top.map((r) => r.label));
   }
+
+  /**
+   * The prompt-aware recall + prediction + behavior nudge, mirroring thatch's
+   * opencode runtime. Returns the combined nudge text, or null when nothing
+   * fires. Best-effort: each sub-nudge is independently guarded.
+   */
 
   async computeNudges(prompt: string): Promise<string | null> {
     if (prompt.trim().length < this.cfg.minPromptLen) return null;
@@ -262,33 +299,28 @@ export class ThatchSession {
     } catch {
       return null;
     }
-    const parts: string[] = [];
-
+    let matches: NudgeMatch[] = [];
+    let predictions: unknown[] = [];
+    let behaviors: unknown[] = [];
     try {
-      const results = this.db.search(this.stores, embedding, { limit: 5 });
-      const matches: NudgeMatch[] = results
+      matches = this.db
+        .search(this.stores, embedding, { limit: NUDGE_LIMIT })
         .filter((r) => r._score >= this.cfg.recallThreshold)
         .map((r) => ({ label: r.label, score: Math.round(r._score * 1000) / 1000 }));
-      if (matches.length > 0) parts.push(this.core.recallNudge(matches));
     } catch {
       /* best-effort */
     }
-
     try {
-      const preds = this.db.scorePredictionNudge(this.stores, embedding, this.cfg.predictionThreshold);
-      if (preds.length > 0) parts.push(this.core.predictionNudge(preds));
+      predictions = this.db.scorePredictionNudge(this.stores, embedding, this.cfg.predictionThreshold, NUDGE_LIMIT);
     } catch {
       /* best-effort */
     }
-
     try {
-      const behaviors = this.db.scoreBehaviorNudge(this.stores, embedding, this.cfg.behaviorThreshold);
-      if (behaviors.length > 0) parts.push(this.core.behaviorNudge(behaviors));
+      behaviors = this.db.scoreBehaviorNudge(this.stores, embedding, this.cfg.behaviorThreshold, NUDGE_LIMIT);
     } catch {
       /* best-effort */
     }
-
-    return parts.length > 0 ? parts.join("\n\n") : null;
+    return formatNudges({ matches, predictions, behaviors });
   }
 
   dispose(): void {

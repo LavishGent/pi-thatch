@@ -114,8 +114,10 @@ for Node parity is tracked in the README.
 - **Recall nudge** (`context` hook, turn start): the user's prompt is embedded
   (`queryEmbed`) and run through `db.search` + `scorePredictionNudge` +
   `scoreBehaviorNudge` with thatch's thresholds (0.55 / 0.60 / 0.60). Matches
-  are formatted with thatch's own `recallNudge` / `predictionNudge` /
-  `behaviorNudge` and injected as an **ephemeral trailing context message**.
+  are formatted by `formatNudges` with the formatters thatch's own MCP-host hook
+  uses (`claudeRecallNudge`, and `predictionNudge` / `behaviorNudge` with
+  `mcpToolName`), so the nudge names tools Pi actually exposes, and injected as
+  an **ephemeral trailing context message**.
   `context` edits are not persisted, so the session transcript stays clean.
 - **Re-familiarization** (`session_start`, `session_compact`): a standing query
   surfaces the project's foundational memories on the next turn, so the agent is

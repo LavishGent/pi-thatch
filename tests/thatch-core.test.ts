@@ -2,14 +2,22 @@ import { test, expect } from "bun:test";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isBunRuntime, loadProvisioning, loadStore, resolveConfig, ThatchSession } from "../src/thatch-core.ts";
+import {
+  familiarizeText,
+  formatNudges,
+  isBunRuntime,
+  loadProvisioning,
+  loadStore,
+  resolveConfig,
+  ThatchSession,
+} from "../src/thatch-core.ts";
 
 // Seam smoke: proves the deep imports into thatch's non-exported internals
 // resolve and still export the symbols we depend on. If a thatch upgrade moves
 // these, this fails loudly instead of the extension silently going quiet.
 test("loadProvisioning exposes the Node-safe thatch internals", async () => {
   const core = await loadProvisioning();
-  expect(typeof core.recallNudge).toBe("function");
+  expect(typeof core.claudeRecallNudge).toBe("function");
   expect(typeof core.predictionNudge).toBe("function");
   expect(typeof core.behaviorNudge).toBe("function");
   expect(typeof core.appendBatch).toBe("function");
@@ -39,12 +47,53 @@ test("concurrent loader calls share one load", async () => {
   expect(c).toBe(d);
 });
 
-test("recallNudge renders thatch's nudge text", async () => {
-  const core = await loadProvisioning();
-  const text = core.recallNudge([{ label: "auth flow", score: 0.9 }]);
-  expect(text).toContain("[thatch]");
-  expect(text).toContain("memory");
-  expect(text).toContain("auth flow");
+// Pi exposes thatch's tools as mcp__thatch__*; the methodology also teaches the
+// bare names. thatch's opencode spellings (thatch_memory_recall, ...) do not
+// exist in Pi, so a nudge naming them sends the model to a missing tool.
+const prediction = {
+  matcher_description: "choosing a test strategy",
+  statement: "prefer integration tests",
+  confidence: 0.8,
+  evidence_count: 3,
+};
+const behavior = {
+  matcher_description: "editing a large function",
+  statement: "read it fully first",
+  confidence: 0.7,
+  evidence_count: 2,
+};
+
+test("formatNudges renders all three parts with Pi's tool names", async () => {
+  const text = await formatNudges({
+    matches: [{ label: "auth flow", score: 0.9 }],
+    predictions: [prediction],
+    behaviors: [behavior],
+  });
+  expect(text).not.toBeNull();
+  const parts = text!.split("\n\n");
+  expect(parts[0]).toContain("auth flow");
+  expect(parts[0]).toContain("memory_recall(");
+  expect(text).toContain("prefer integration tests");
+  expect(text).toContain("mcp__thatch__prediction_query");
+  expect(text).toContain("read it fully first");
+  expect(text).toContain("mcp__thatch__behavior_list");
+  expect(text).not.toMatch(/\bthatch_[a-z_]+/);
+});
+
+test("formatNudges skips empty parts and returns null when nothing fires", async () => {
+  expect(await formatNudges({ matches: [], predictions: [], behaviors: [] })).toBeNull();
+  const only = await formatNudges({ matches: [], predictions: [prediction], behaviors: [] });
+  expect(only).toContain("User decision model");
+  expect(only).not.toContain("relate to this prompt");
+});
+
+test("familiarizeText lists labels and names the Pi recall tool", () => {
+  expect(familiarizeText([])).toBeNull();
+  const one = familiarizeText(["conventions"]);
+  expect(one).toContain('1 foundational memory exist');
+  expect(one).toContain('"conventions"');
+  expect(one).toContain("mcp__thatch__memory_recall");
+  expect(familiarizeText(["a", "b"])).toContain("2 foundational memories");
 });
 
 test("resolveConfig mirrors thatch's env chain and defaults", () => {
