@@ -42,6 +42,7 @@ import {
   getMethodology,
   getCommandDefs,
   provisionSkills,
+  isBunRuntime,
 } from "./thatch-core.ts";
 
 const THATCH_VERSION = "0.2.9";
@@ -170,20 +171,30 @@ export default async function piThatch(pi: ExtensionAPI): Promise<void> {
     if (isChild) return;
     disposeSession();
     const sessionId = randomUUID();
-    building = Promise.all([
-      ThatchSession.create(ctx.cwd).then((s) => {
-        session = s;
-      }),
-      ExtractionBuffer.create(sessionId).then((b) => {
+    // The buffer is Node-safe; the in-process store is Bun-only. Each is
+    // guarded on its own so a store failure never costs the buffer (or vice
+    // versa), and the Node case is a deliberate skip rather than a caught crash.
+    const buildBuffer = ExtractionBuffer.create(sessionId)
+      .then((b) => {
         buffer = b;
-      }),
-    ])
-      .then(() => {
-        pendingFamiliarize = true;
       })
       .catch((err) => {
-        debug(`session init failed: ${err}`);
+        debug(`extraction buffer init failed: ${err}`);
       });
+    let buildStore: Promise<void> = Promise.resolve();
+    if (isBunRuntime()) {
+      buildStore = ThatchSession.create(ctx.cwd)
+        .then((s) => {
+          session = s;
+          pendingFamiliarize = true;
+        })
+        .catch((err) => {
+          debug(`in-process store init failed (recall nudge off): ${err}`);
+        });
+    } else {
+      debug("in-process store skipped: Pi is running on Node (recall nudge off)");
+    }
+    building = Promise.all([buildBuffer, buildStore]).then(() => undefined);
   });
 
   pi.on("session_compact", (_e: SessionCompactEvent) => {
