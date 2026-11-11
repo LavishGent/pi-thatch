@@ -2,7 +2,7 @@
  * Store detection for Node: which thatch store a directory's memories live in.
  *
  * A port of thatch's `detectRepo` / `parseGitUrl` (src/git.ts in
- * @jeffober/thatch 0.2.9). thatch's module imports Bun's `$` at the top, so it
+ * @jeffober/thatch 0.4.0). thatch's module imports Bun's `$` at the top, so it
  * cannot load on Node; this version runs git through node:child_process
  * instead. tests/repo.test.ts checks it against thatch's own functions on
  * every directory shape, so a drift in either fails loudly.

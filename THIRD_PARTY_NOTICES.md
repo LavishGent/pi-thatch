@@ -3,7 +3,7 @@
 ## thatch
 
 `src/repo.ts` ports `parseGitUrl` and `detectRepo` from thatch's `src/git.ts`
-(`@jeffober/thatch` 0.2.9, https://github.com/sysread/thatch). pi-thatch also
+(`@jeffober/thatch` 0.4.0, https://github.com/sysread/thatch). pi-thatch also
 depends on `@jeffober/thatch` at runtime. thatch is distributed under the
 following license:
 

@@ -52,7 +52,7 @@ import {
   isBunRuntime,
 } from "./thatch-core.ts";
 
-const THATCH_VERSION = "0.2.9";
+const THATCH_VERSION = "0.4.0";
 const METHODOLOGY_MARKER = "# Persistence";
 
 type AgentMessage = ContextEvent["messages"][number];

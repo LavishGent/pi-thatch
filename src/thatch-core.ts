@@ -1,6 +1,6 @@
 /**
  * Blast door: the ONLY module that reaches into @jeffober/thatch's
- * non-exported internals. Everything here is pinned to thatch 0.2.9 and
+ * non-exported internals. Everything here is pinned to thatch 0.4.0 and
  * validated by tests/thatch-core.test.ts; if an upgrade moves these symbols,
  * that test fails loudly instead of the extension misbehaving at runtime.
  *
@@ -12,13 +12,16 @@
  *
  * Two loaders, because two of thatch's modules are Bun-only:
  *   - loadProvisioning(): prompts / commands / skills / extract-queue /
- *     sideband. Plain Node code; backs methodology, commands, skills,
- *     extraction buffering, and the sideband recall client.
+ *     sideband. Plain Node code except that, in 0.4.0, commands.ts and
+ *     extract-queue.ts need src/node-shim.ts to load on Node. Backs
+ *     methodology, commands, skills, extraction buffering, and the sideband
+ *     recall client.
  *   - loadStore(): db (bun:sqlite) / embeddings / git (Bun's `$`). Backs the
  *     in-process recall nudge; refuses to load when Pi is not running on Bun.
  */
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
+import { loadCommandsOnNode, loadExtractQueueOnNode } from "./node-shim.ts";
 import { detectRepoNode } from "./repo.ts";
 
 // --- Minimal structural types for the thatch internals we touch -------------
@@ -82,7 +85,9 @@ export interface ProvisioningCore {
   // provisioning (methodology / commands / skills)
   cursorInstructions: () => string;
   mcpToolName: (name: string) => string;
-  actionDefs: (tool: (name: string) => string) => ActionDef[];
+  actionDefs: () => ActionDef[];
+  // Rewrites the opencode spelling (thatch_x) in command bodies to mcp__thatch__x.
+  mcpSpelling: (text: string) => string;
   installSkills: (skillsDir: string) => unknown;
   // sideband.ts: client for the thatch MCP server's warm-model socket. Each
   // request resolves null on any failure (no server, timeout, bad reply).
@@ -147,9 +152,11 @@ function memoize<T>(load: () => Promise<T>): () => Promise<T> {
 export const loadProvisioning: () => Promise<ProvisioningCore> = memoize(async () => {
   const src = thatchSrcDir();
   const prompts = await import(join(src, "prompts.ts"));
-  const commands = await import(join(src, "commands.ts"));
+  // thatch 0.4.0's commands.ts and extract-queue.ts cannot load on Node as
+  // published; the shim imports patched copies there (see node-shim.ts).
+  const commands = isBunRuntime() ? await import(join(src, "commands.ts")) : await loadCommandsOnNode(src);
   const skills = await import(join(src, "skills.ts"));
-  const queue = await import(join(src, "extract-queue.ts"));
+  const queue = isBunRuntime() ? await import(join(src, "extract-queue.ts")) : await loadExtractQueueOnNode(src);
   const sideband = await import(join(src, "sideband.ts"));
   return {
     claudeRecallNudge: prompts.claudeRecallNudge,
@@ -163,6 +170,7 @@ export const loadProvisioning: () => Promise<ProvisioningCore> = memoize(async (
     cursorInstructions: prompts.cursorInstructions,
     mcpToolName: prompts.mcpToolName,
     actionDefs: commands.actionDefs,
+    mcpSpelling: commands.mcpSpelling,
     installSkills: skills.installSkills,
     sidebandSocketPath: sideband.sidebandSocketPath,
     sidebandMatch: sideband.sidebandMatch,
@@ -556,13 +564,13 @@ export interface PiCommand {
   body: string;
 }
 
-/** The 6 shared action commands (opencode-only ones filtered out), MCP-spelled. */
+/** The shared action commands (opencode-only ones filtered out), MCP-spelled. */
 export async function getCommandDefs(): Promise<PiCommand[]> {
   const core = await loadProvisioning();
   return core
-    .actionDefs(core.mcpToolName)
+    .actionDefs()
     .filter((d) => !d.opencodeOnly)
-    .map((d) => ({ name: d.name, description: d.description, body: d.body }));
+    .map((d) => ({ name: d.name, description: d.description, body: core.mcpSpelling(d.body) }));
 }
 
 /** Install thatch's skills into `dir` (idempotent). Returns the dir for resources_discover. */

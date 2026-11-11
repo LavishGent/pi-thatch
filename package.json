@@ -52,7 +52,7 @@
     "prepublishOnly": "bun test && tsc --noEmit"
   },
   "dependencies": {
-    "@jeffober/thatch": "0.2.9"
+    "@jeffober/thatch": "0.4.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"

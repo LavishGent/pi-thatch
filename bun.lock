@@ -5,7 +5,7 @@
     "": {
       "name": "pi-thatch",
       "dependencies": {
-        "@jeffober/thatch": "0.2.9",
+        "@jeffober/thatch": "0.4.0",
       },
       "devDependencies": {
         "@earendil-works/pi-coding-agent": "^1.2.0",
@@ -142,7 +142,7 @@
 
     "@img/sharp-win32-x64": ["@img/sharp-win32-x64@0.35.5", "", { "os": "win32", "cpu": "x64" }, "sha512-x76eH0vEiHlcMQu8Y8IenntaACtddpT6W0wmXtWrnKcnKI7ME5DdgqhAD6SEWOEl1v2zDvkZDhFA9KnURwpfqg=="],
 
-    "@jeffober/thatch": ["@jeffober/thatch@0.2.9", "", { "dependencies": { "@huggingface/transformers": "^4.0.0", "onnxruntime-web": "1.26.0-dev.20260416-b7804b056c", "zod": "^4.1.0" }, "peerDependencies": { "@opencode-ai/plugin": "^1.17.0", "@opencode/plugin": "^2.0.15" }, "optionalPeers": ["@opencode-ai/plugin", "@opencode/plugin"], "bin": { "thatch": "bin/thatch" } }, "sha512-Qq4MnkW1SrabLHPICfsMFqvPWj8QLdytd6W/fACvlCqDJ2HyOd82um/tN7uSciegdOQu7k+UrUqXcPN3l/UXuw=="],
+    "@jeffober/thatch": ["@jeffober/thatch@0.4.0", "", { "dependencies": { "@huggingface/transformers": "^4.0.0", "onnxruntime-web": "1.26.0-dev.20260416-b7804b056c", "zod": "^4.1.0" }, "peerDependencies": { "@opencode/plugin": "^2.1.1" }, "optionalPeers": ["@opencode/plugin"], "bin": { "thatch": "bin/thatch" } }, "sha512-9fwmpwanv3GV8Z3paT6aesu+Y8Jqny0KQx5PjWMaCapwKPztxMCJo6KqPKwMbbFMNSmVeNvCMXTn/YRW+rJb8A=="],
 
     "@protobufjs/aspromise": ["@protobufjs/aspromise@1.1.2", "", {}, "sha512-j+gKExEuLmKwvz3OgROXtrJ2UG2x8Ch2YZUxahh+s1F2HZ+wAceUNLkvy6zKCPVRkU++ZWQrdxsUeQXmcg4uoQ=="],
 
