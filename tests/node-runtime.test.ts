@@ -58,7 +58,7 @@ run("under Node: provisioning, extraction, re-familiarization, and recall all wo
   const { report, stderr } = await runFixture(0);
 
   expect(report.mcpServers).toEqual(["thatch"]);
-  expect(report.commands).toEqual(["defrag", "hygiene", "peer-review", "refine", "reflect", "self-review"]);
+  expect(report.commands).toEqual(["bug-intake", "defrag", "hygiene", "peer-review", "refine", "reflect", "self-review"]);
   expect(report.methodology).toBe(true);
   expect(report.skillInstalled).toBe(true);
 
