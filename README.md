@@ -30,8 +30,8 @@ That's it. On first load the extension:
 - registers the thatch **MCP server** (the 29 memory/prediction/behavior/chat
   tools, declared to the model);
 - appends the thatch **methodology** to the system prompt;
-- registers the 6 **slash commands** (`/reflect`, `/defrag`, `/hygiene`,
-  `/refine`, `/self-review`, `/peer-review`);
+- registers the 7 **slash commands** (`/reflect`, `/defrag`, `/hygiene`,
+  `/refine`, `/self-review`, `/peer-review`, `/bug-intake`);
 - installs thatch's **skills** into a cache dir and offers them to the session.
 
 ### Requirements
@@ -67,8 +67,8 @@ longer required for any feature.
 | **Recall nudge** | at each turn the prompt is matched against your memories; relevant ones (plus predictions/behaviors) are injected automatically |
 | **Re-familiarization** | at session start and after every compaction, foundational memories are surfaced so the agent is never amnesiac |
 | **Fact extraction** | tool interactions are buffered; the agent is reminded (or a background child is spawned) to distil durable facts into memory |
-| **Slash commands** | `/reflect` `/defrag` `/hygiene` `/refine` `/self-review` `/peer-review` |
-| **Skills** | 36 thatch skills (code review, archaeology, memory workflows, writing) |
+| **Slash commands** | `/reflect` `/defrag` `/hygiene` `/refine` `/self-review` `/peer-review` `/bug-intake` |
+| **Skills** | 41 thatch skills (code review, archaeology, memory workflows, writing) |
 | **Alerts** | opt-in desktop notification on pause (needs input) and done (real work) |
 
 ## Configuration (env)

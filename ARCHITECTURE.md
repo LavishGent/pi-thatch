@@ -35,7 +35,7 @@ Two facts shaped the design:
                        │   provisionSkills │                       │
                        └───────────────────┼───────────────────────┘
                         before_agent_start ─┘  appendSystemPrompt (methodology)
-                        resources_discover ──► skillPaths (36 skills)
+                        resources_discover ──► skillPaths (41 skills)
                         context ───────────────► recall/prediction/behavior +
                                                  re-familiarization + extraction
                                                  nudge (ephemeral injection)
@@ -74,7 +74,27 @@ place that reaches thatch's non-exported internals:
   evaluation; under jiti a second concurrent import can otherwise observe a
   half-initialized module. A rejected load is not cached.
 
-Everything is pinned to `@jeffober/thatch@0.2.9` and guarded by
+**Node shim (`src/node-shim.ts`).** As published in 0.4.0, two thatch modules
+in `loadProvisioning()` cannot load on Node:
+
+- `commands.ts` calls `import.meta.dir`, which only Bun defines.
+- `extract-queue.ts` imports `MEMORY_SAVED_MARKER` from `tool-defs.ts`, which
+  pulls in `session-db.ts` and `bun:sqlite`.
+
+Under Bun, `loadProvisioning()` imports both normally. Under Node it calls the
+shim, which reads thatch's own source, replaces only those two pieces
+(`import.meta.dir` becomes the real source directory; the marker import becomes
+a constant read from `tool-defs.ts`), writes the result to a private temp
+directory, imports it, and deletes it. No thatch logic is copied, so behavior
+tracks the installed version. If an upgrade changes the text the shim replaces,
+it throws a clear error and `tests/node-shim.test.ts` fails. That test also
+compares the patched modules with thatch's native ones under Bun.
+
+Delete the shim once thatch ships Node-safe versions of both modules. The
+upstream fix is small: use `fileURLToPath(import.meta.url)` in `commands.ts`,
+and move the marker constants into an import-free module.
+
+Everything is pinned to `@jeffober/thatch@0.4.0` and guarded by
 `tests/thatch-core.test.ts`, which asserts each loader's symbols still exist
 (and that nothing Bun-only leaks into the provisioning side). If a thatch
 upgrade moves them, that test fails loudly instead of the extension silently
@@ -88,7 +108,7 @@ The factory is `async`; Pi awaits it before startup continues, so everything is
 in place for the first session.
 
 1. **MCP server** — `pi.registerMcpServer("thatch", { command: "bunx", args:
-   ["@jeffober/thatch@0.2.9", "mcp"], exposure: "direct" })`. `direct` so the 29
+   ["@jeffober/thatch@0.4.0", "mcp"], exposure: "direct" })`. `direct` so the 29
    tools are declared to the model.
 2. **Commands** — `getCommandDefs()` calls thatch's `actionDefs(mcpToolName)`,
    drops the OpenCode-only ones, and registers the remaining 6 with
@@ -99,7 +119,7 @@ in place for the first session.
    `systemPromptOptions.appendSystemPrompt`, guarded by a marker so it is added
    once and stays byte-identical across turns (prompt-cache safe).
 4. **Skills** — `provisionSkills(cacheDir)` calls thatch's `installSkills` to
-   write the 36 skills under `~/.cache/pi-thatch/skills` (idempotent); a
+   write the 41 skills under `~/.cache/pi-thatch/skills` (idempotent); a
    `resources_discover` handler returns that path as `skillPaths`.
 
 ## Ambient behaviors
@@ -215,8 +235,10 @@ Pi (Node or Bun) process                  thatch MCP subprocess (Bun, via bunx)
 |---|---|
 | `src/index.ts` | Extension factory: provisioning + all event hooks |
 | `src/thatch-core.ts` | Blast door (`loadProvisioning` / `loadStore`) + `ThatchSession`, `SidebandRecall`, `ExtractionBuffer`, nudge/provisioning helpers |
+| `src/node-shim.ts` | Node-only loader that patches thatch 0.4.0's `commands.ts` and `extract-queue.ts` so they load without Bun |
 | `src/repo.ts` | Node port of thatch's repo/store detection |
 | `tests/thatch-core.test.ts` | Seam smoke (pins the thatch internals per loader), config, nudge text, recall/familiarize |
+| `tests/node-shim.test.ts` | Shim output matches thatch's native modules (Bun), fails loudly on mismatch, cleans up its temp copy |
 | `tests/repo.test.ts` | Store-detection parity with thatch's own `detectRepo` / `parseGitUrl` |
 | `tests/sideband.test.ts` | `SidebandRecall` against thatch's real `SidebandServer` (fake model + DB) |
 | `tests/extraction.test.ts` | Buffering, meta-filter, drain-on-save, nudge text |
